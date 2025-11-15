@@ -2,7 +2,10 @@
 
 namespace App\Http\Controllers;
 
+use App\Events\RecordingCreated;
+use App\Events\RecordingDeleted;
 use App\Http\Requests\StoreRecordingRequest;
+use App\Jobs\ProcessRecording;
 use App\Models\Recording;
 use App\Services\FFmpegService;
 use App\Services\GoogleDriveService;
@@ -93,14 +96,17 @@ class RecordingController extends Controller
                 'description' => $request->input('description'),
                 'original_filename' => $originalFilename,
                 'local_path' => $webmPath,
-                'status' => 'converting',
+                'status' => 'uploading',
                 'mime_type' => $file->getMimeType(),
                 'file_size' => $file->getSize(),
                 'recorded_at' => now(),
             ]);
 
-            // Process in background (you could use Laravel queues for this)
-            $this->processRecording($recording);
+            // Dispatch job to process recording in background
+            ProcessRecording::dispatch($recording);
+
+            // Broadcast recording created event
+            event(new RecordingCreated($recording));
 
             return response()->json([
                 'success' => true,
@@ -120,80 +126,6 @@ class RecordingController extends Controller
         }
     }
 
-    /**
-     * Process the recording (convert and upload to Google Drive).
-     */
-    private function processRecording(Recording $recording): void
-    {
-        try {
-            // Convert WebM to MP4
-            $mp4Filename = pathinfo($recording->original_filename, PATHINFO_FILENAME) . '.mp4';
-            $mp4Path = storage_path('app/temp/recordings/' . Str::uuid() . '.mp4');
-
-            $this->ffmpegService->convertWebMToMp4($recording->local_path, $mp4Path);
-
-            // Get video duration
-            $duration = $this->ffmpegService->getVideoDuration($mp4Path);
-            $recording->update(['duration' => $duration]);
-
-            // Update status
-            $recording->update(['status' => 'uploading_to_drive']);
-
-            // Upload to Google Drive
-            $user = $recording->user;
-            $this->googleDriveService->setUser($user);
-
-            // Create recording folder
-            $folderId = $this->googleDriveService->createRecordingFolder();
-
-            // Upload the MP4 file
-            $uploadResult = $this->googleDriveService->uploadFile(
-                $mp4Path,
-                $mp4Filename,
-                $folderId,
-                'video/mp4'
-            );
-
-            // Set file permission based on visibility
-            if ($recording->visibility !== 'private') {
-                $this->googleDriveService->setFilePermission(
-                    $uploadResult['file_id'],
-                    'anyone',
-                    'reader'
-                );
-            }
-
-            // Update recording with Google Drive info
-            $recording->update([
-                'google_drive_file_id' => $uploadResult['file_id'],
-                'google_drive_folder_id' => $folderId,
-                'google_drive_url' => $uploadResult['web_view_link'],
-                'share_link' => $uploadResult['web_view_link'],
-                'file_size' => $uploadResult['size'],
-                'status' => 'completed',
-            ]);
-
-            // Clean up local files
-            if (file_exists($recording->local_path)) {
-                unlink($recording->local_path);
-            }
-            if (file_exists($mp4Path)) {
-                unlink($mp4Path);
-            }
-
-            $recording->update(['local_path' => null]);
-        } catch (\Exception $e) {
-            Log::error('Failed to process recording', [
-                'recording_id' => $recording->id,
-                'error' => $e->getMessage(),
-            ]);
-
-            $recording->update([
-                'status' => 'failed',
-                'error_message' => $e->getMessage(),
-            ]);
-        }
-    }
 
     /**
      * Display the specified recording.
@@ -259,6 +191,9 @@ class RecordingController extends Controller
         $this->authorize('delete', $recording);
 
         try {
+            $userId = $recording->user_id;
+            $recordingId = $recording->id;
+
             // Delete from Google Drive
             if ($recording->google_drive_file_id) {
                 $this->googleDriveService->setUser($recording->user);
@@ -271,6 +206,9 @@ class RecordingController extends Controller
             }
 
             $recording->delete();
+
+            // Broadcast recording deleted event
+            event(new RecordingDeleted($recordingId, $userId));
 
             return response()->json([
                 'success' => true,
