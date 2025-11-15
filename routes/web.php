@@ -1,9 +1,12 @@
 <?php
 
+use App\Http\Controllers\AnalyticsController;
 use App\Http\Controllers\GoogleDriveController;
 use App\Http\Controllers\ProfileController;
 use App\Http\Controllers\RecordingController;
+use App\Models\Recording;
 use Illuminate\Foundation\Application;
+use Illuminate\Support\Facades\Auth;
 use Illuminate\Support\Facades\Route;
 use Inertia\Inertia;
 
@@ -17,7 +20,23 @@ Route::get('/', function () {
 });
 
 Route::get('/dashboard', function () {
-    return Inertia::render('Dashboard');
+    $recentRecordings = Recording::where('user_id', Auth::id())
+        ->latest()
+        ->limit(5)
+        ->get()
+        ->map(function ($recording) {
+            return [
+                'id' => $recording->id,
+                'title' => $recording->title,
+                'status' => $recording->status,
+                'created_at' => $recording->created_at?->toIso8601String(),
+                'recorded_at' => $recording->recorded_at?->toIso8601String(),
+            ];
+        });
+
+    return Inertia::render('Dashboard', [
+        'recentRecordings' => $recentRecordings,
+    ]);
 })->middleware(['auth', 'verified'])->name('dashboard');
 
 Route::middleware('auth')->group(function () {
@@ -36,6 +55,12 @@ Route::middleware('auth')->group(function () {
     // Recording routes
     Route::resource('recordings', RecordingController::class);
     Route::get('/recordings/{recording}/status', [RecordingController::class, 'status'])->name('recordings.status');
+
+    // Analytics routes
+    Route::prefix('analytics')->name('analytics.')->group(function () {
+        Route::get('/', [AnalyticsController::class, 'index'])->name('index');
+        Route::get('/data', [AnalyticsController::class, 'data'])->name('data');
+    });
 });
 
 require __DIR__.'/auth.php';
